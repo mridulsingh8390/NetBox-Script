@@ -575,20 +575,24 @@ def create_netbox_superuser_and_token(netbox_dir: str, admin_password: str) -> s
     """
     import time
 
-    env = os.environ.copy()
-    env.update({
-        "DJANGO_SUPERUSER_USERNAME": "admin",
-        "DJANGO_SUPERUSER_EMAIL": "admin@example.local",
-        "DJANGO_SUPERUSER_PASSWORD": admin_password,
-    })
+    # IMPORTANT: `docker compose exec` does NOT forward the host process's
+    # environment into the container automatically - setting env=... on
+    # subprocess.run() only affects the `docker compose exec` process itself,
+    # not what manage.py sees inside the container. The variables must be
+    # passed explicitly via `-e KEY=VALUE` flags on the exec command itself.
+    superuser_env_flags = [
+        "-e", "DJANGO_SUPERUSER_USERNAME=admin",
+        "-e", "DJANGO_SUPERUSER_EMAIL=admin@example.local",
+        "-e", f"DJANGO_SUPERUSER_PASSWORD={admin_password}",
+    ]
 
     log.info("[bootstrap] Creating NetBox admin user (idempotent - skips if it already exists)...")
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
         result = subprocess.run(
-            ["docker", "compose", "exec", "-T", "netbox",
+            ["docker", "compose", "exec", "-T"] + superuser_env_flags + ["netbox",
              "/opt/netbox/netbox/manage.py", "createsuperuser", "--noinput"],
-            cwd=netbox_dir, env=env, capture_output=True, text=True,
+            cwd=netbox_dir, capture_output=True, text=True,
         )
         stderr = result.stderr or ""
         if result.returncode == 0 or "already exists" in stderr:
