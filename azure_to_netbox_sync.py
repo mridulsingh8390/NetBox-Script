@@ -783,9 +783,12 @@ def sync_to_netbox(nb: pynetbox.api, discovered: list[DiscoveredPrefix]) -> dict
                     existing.description = description
                     changed = True
 
-                # Build the new tag list as plain slugs (strings), never mixing
-                # in the Record objects existing.tags returns - assigning a
-                # mixed list back to pynetbox on .save() is unsafe/undefined.
+                # NetBox's REST API requires tags to be referenced as {"slug": ...}
+                # dicts (or numeric IDs) on create/update - NOT bare strings. Passing
+                # plain strings causes a 400 Bad Request ("Related objects must be
+                # referenced by numeric ID or by dictionary of attributes"). Track
+                # the current set as plain slugs for easy membership checks, but
+                # always convert to the {"slug": ...} dict form before writing back.
                 tag_slugs = [t.slug for t in existing.tags]
                 if SYNC_TAG not in tag_slugs:
                     tag_slugs.append(SYNC_TAG)
@@ -795,7 +798,7 @@ def sync_to_netbox(nb: pynetbox.api, discovered: list[DiscoveredPrefix]) -> dict
                     changed = True
 
                 if changed:
-                    existing.tags = tag_slugs
+                    existing.tags = [{"slug": s} for s in tag_slugs]
                     existing.save()
                     summary["updated"] += 1
                 else:
@@ -805,7 +808,7 @@ def sync_to_netbox(nb: pynetbox.api, discovered: list[DiscoveredPrefix]) -> dict
                     prefix=item.prefix,
                     description=description,
                     status="active",
-                    tags=[SYNC_TAG],
+                    tags=[{"slug": SYNC_TAG}],
                 )
                 summary["created"] += 1
         except Exception as e:
@@ -821,7 +824,7 @@ def sync_to_netbox(nb: pynetbox.api, discovered: list[DiscoveredPrefix]) -> dict
             tag_slugs = [t.slug for t in p.tags]
             if STALE_TAG not in tag_slugs:
                 tag_slugs.append(STALE_TAG)
-                p.tags = tag_slugs
+                p.tags = [{"slug": s} for s in tag_slugs]
                 p.save()
                 summary["stale_flagged"] += 1
                 log.warning(f"Prefix {p.prefix} no longer seen in Azure - flagged for review")
