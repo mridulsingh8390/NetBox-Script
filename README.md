@@ -162,6 +162,7 @@ At this point the deployment is fully verified end to end — see sections 1+ be
 | Sync config | `/root/NetBox-Script/netbox-azure-sync.env` | Credentials + settings (mode 600) |
 | Sync logs | `/root/NetBox-Script/netbox-azure-sync.log` | Output of every cron run |
 | Cron schedule | `0 3 * * *` (**server local time** — check with `timedatectl`) | Runs the sync automatically, once daily |
+| Backup script | `netbox_backup.sh` | Daily Postgres backup, optional Azure Blob upload — see section 5 |
 | NetBox UI | `http://<vm-ip>:8000` | Login: `admin` / (password set at bootstrap — see section 4 if lost) |
 
 **Data flow:** Azure (Reader-only) → sync script → NetBox REST API → Prefixes tagged `azure-sync`.
@@ -252,13 +253,38 @@ Then verify with a manual sync run.
 
 **What matters:** the Postgres database (all of NetBox's data lives there).
 
+### Automated daily backup (recommended, now available)
+
+`netbox_backup.sh` — dumps, compresses, applies local retention, and optionally uploads to Azure Blob Storage. Same self-installing cron pattern as the sync script.
+
 ```bash
-# Manual backup
+# One-time setup
+chmod +x netbox_backup.sh
+
+# Run once manually to verify it works
+./netbox_backup.sh
+
+# Install the daily cron job (default: 2am server local time)
+./netbox_backup.sh --install-cron "0 2 * * *"
+```
+
+Optional: ship backups off this VM to Azure Blob Storage (recommended — a single-VM deployment has no redundancy if the disk is lost):
+```bash
+export AZURE_STORAGE_UPLOAD=true
+export AZURE_STORAGE_ACCOUNT=<your-storage-account>
+export AZURE_STORAGE_CONTAINER=netbox-backups   # optional, this is the default
+./netbox_backup.sh --install-cron "0 2 * * *"
+```
+Set these as permanent exports (e.g. in `/etc/environment` or by editing the cron line directly) if you want the scheduled runs to also upload, not just manual ones.
+
+Default local retention: 14 days (`RETENTION_DAYS` env var to change). Backups land in `/root/netbox-backups/` by default (`BACKUP_DIR` to change). Remove the scheduled backup with `./netbox_backup.sh --uninstall-cron`.
+
+### Manual backup (one-off, or if you'd rather not use the script)
+
+```bash
 cd /opt/netbox-docker
 docker compose exec -T postgres pg_dump -U netbox netbox | gzip > /root/netbox-backup-$(date +%F).sql.gz
 ```
-
-There is currently **no automated backup schedule configured** — this is a gap worth closing. Recommended: add a second cron entry running the above nightly, shipping the output somewhere off this VM (Azure Blob Storage, etc.), since a single-VM deployment has no redundancy if the disk is lost.
 
 **Restore from backup:**
 ```bash
@@ -296,7 +322,7 @@ This section is built from actual issues hit during this deployment — check he
 - **VNet-level CIDRs only** — subnet-level CIDRs within each VNet are not synced. Extending this is a defined, separate piece of work if needed.
 - **No automatic reservation workflow** — engineers manually check NetBox's "available prefixes" before writing Terraform `tfvars`; nothing reserves a range automatically. Small race-condition risk if two engineers provision simultaneously (documented, accepted tradeoff for simplicity).
 - **No topology mapping** — NetBox tracks CIDRs, not VNet peerings/NSGs/"what's connected to what." Out of scope for this deployment as built.
-- **Single VM, no HA** — if this VM is lost, NetBox and its data go with it unless backups (section 5) are actually being taken regularly. This is currently a manual/undone step, not automated.
+- **Single VM, no HA** — if this VM is lost entirely (not just the disk), NetBox goes down until redeployed. `netbox_backup.sh` (section 5) mitigates data loss if you've enabled the Azure Blob upload option — confirm that's actually turned on, since it's opt-in, not default.
 
 ## 9. Escalation
 
