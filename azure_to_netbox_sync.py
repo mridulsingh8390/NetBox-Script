@@ -448,6 +448,26 @@ def require_root() -> None:
         sys.exit(1)
 
 
+def _command_succeeds(cmd: list[str]) -> bool:
+    """
+    Safely check whether a command runs successfully - treats BOTH a
+    non-zero exit code AND the binary not existing at all as "not available".
+
+    subprocess.run raises FileNotFoundError (not just a non-zero return
+    code) when the executable itself isn't found on PATH - this matters a
+    lot here, since these checks run on fresh VMs specifically to detect
+    "is docker/az installed yet", where the answer is very often "no, not
+    even the binary exists". Checking only .returncode without catching
+    this exception crashes the whole bootstrap instead of correctly
+    proceeding to the install step.
+    """
+    try:
+        result = subprocess.run(cmd, capture_output=True)
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
 def run_cmd(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     """subprocess.run wrapper that logs the command and raises on failure."""
     log.info(f"[bootstrap] $ {' '.join(cmd)}")
@@ -456,8 +476,7 @@ def run_cmd(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
 
 def install_docker() -> None:
     """Install Docker Engine + Compose plugin on a Debian/Ubuntu VM, if not already present."""
-    check = subprocess.run(["docker", "compose", "version"], capture_output=True)
-    if check.returncode == 0:
+    if _command_succeeds(["docker", "compose", "version"]):
         log.info("[bootstrap] Docker + Compose plugin already installed - skipping.")
         return
 
@@ -618,12 +637,11 @@ def create_azure_service_principal(subscription_id: str, sp_name: str = "netbox-
     that genuinely needs a human to authenticate interactively at least
     once; there's no way to create a credential without one.
     """
-    az_check = subprocess.run(["az", "account", "show"], capture_output=True, text=True)
-    if az_check.returncode != 0:
+    if not _command_succeeds(["az", "account", "show"]):
         log.error(
-            "[bootstrap] Not logged into Azure CLI. Run 'az login' interactively once "
-            "(this is the one manual step that can't be automated), then re-run with "
-            "--bootstrap --create-azure-sp."
+            "[bootstrap] Azure CLI isn't installed, or you're not logged in. If 'az' was just "
+            "installed, run 'az login' interactively once (this is the one manual step that "
+            "can't be automated), then re-run with --bootstrap --create-azure-sp."
         )
         sys.exit(1)
 
@@ -662,10 +680,11 @@ def bootstrap(args) -> None:
         if not args.azure_subscription_id:
             log.error("--create-azure-sp requires --azure-subscription-id")
             sys.exit(1)
-        az_check = subprocess.run(["az", "--version"], capture_output=True)
-        if az_check.returncode != 0:
+        if not _command_succeeds(["az", "--version"]):
             log.info("[bootstrap] Installing Azure CLI...")
-            run_cmd(["bash", "-c", "curl -sL https://aka.ms/InstallAzureCLIDeb | bash"])
+            # Official Microsoft install script for Debian/Ubuntu (apt-based), per
+            # https://learn.microsoft.com/cli/azure/install-azure-cli-linux
+            run_cmd(["bash", "-c", "curl -fsSL 'https://azurecliprod.blob.core.windows.net/$root/deb_install.sh' | bash"])
         sp_creds = create_azure_service_principal(args.azure_subscription_id)
         config_lines.append(f"AZURE_SUBSCRIPTION_ID={args.azure_subscription_id}")
         for k, v in sp_creds.items():
