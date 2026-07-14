@@ -324,9 +324,3 @@ This section is built from actual issues hit during this deployment — check he
 - **No topology mapping** — NetBox tracks CIDRs, not VNet peerings/NSGs/"what's connected to what." Out of scope for this deployment as built.
 - **Single VM, no HA** — if this VM is lost entirely (not just the disk), NetBox goes down until redeployed. `netbox_backup.sh` (section 5) mitigates data loss if you've enabled the Azure Blob upload option — confirm that's actually turned on, since it's opt-in, not default.
 
-## 9. Escalation
-
-For issues not covered above:
-1. Check `/root/NetBox-Script/netbox-azure-sync.log` and `docker compose logs netbox` for the actual error text first
-2. NetBox community docs: https://docs.netbox.dev/
-3. NetBox GitHub issues (for suspected NetBox bugs): https://github.com/netbox-community/netbox/issues
