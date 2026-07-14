@@ -108,6 +108,52 @@ REQUIRED_PACKAGES = [
 ]
 
 
+def _ensure_pip_available() -> None:
+    """
+    Some minimal/cloud-image Ubuntu & Debian installs ship WITHOUT pip at all
+    (python3-pip isn't in the base image) - in that case 'python3 -m pip ...'
+    fails with 'No module named pip' regardless of --break-system-packages,
+    since the problem isn't PEP 668, it's that pip doesn't exist yet. Detect
+    that specific case and install python3-pip via apt before proceeding.
+    """
+    check = subprocess.run([sys.executable, "-m", "pip", "--version"], capture_output=True)
+    if check.returncode == 0:
+        return  # pip already available
+
+    print("[bootstrap] pip is not installed - attempting to install python3-pip via apt...", file=sys.stderr)
+
+    if not os.path.exists("/etc/debian_version"):
+        print(
+            "[bootstrap] ERROR: pip is missing and this isn't a Debian/Ubuntu system "
+            "(no apt available to auto-install python3-pip). Install pip manually for "
+            "this Python interpreter, then re-run.", file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if os.geteuid() != 0:
+        print(
+            "[bootstrap] ERROR: pip is missing and installing python3-pip requires root. "
+            "Run: sudo apt-get update && sudo apt-get install -y python3-pip", file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        subprocess.run(["apt-get", "update", "-qq"], check=True)
+        subprocess.run(["apt-get", "install", "-y", "-qq", "python3-pip"], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"[bootstrap] ERROR: failed to install python3-pip automatically: {e}", file=sys.stderr)
+        print("[bootstrap] Try manually: sudo apt-get update && sudo apt-get install -y python3-pip", file=sys.stderr)
+        sys.exit(1)
+
+    # Confirm it actually worked before proceeding
+    check = subprocess.run([sys.executable, "-m", "pip", "--version"], capture_output=True)
+    if check.returncode != 0:
+        print("[bootstrap] ERROR: python3-pip installed but 'python3 -m pip' still doesn't work. Investigate manually.", file=sys.stderr)
+        sys.exit(1)
+
+    print("[bootstrap] pip installed successfully.", file=sys.stderr)
+
+
 def _ensure_dependencies() -> None:
     if os.environ.get("SKIP_AUTO_INSTALL"):
         return
@@ -118,6 +164,8 @@ def _ensure_dependencies() -> None:
         return  # already installed - nothing to do
     except ImportError:
         pass
+
+    _ensure_pip_available()
 
     print("[bootstrap] Required Python packages not found - installing now...", file=sys.stderr)
     base_cmd = [sys.executable, "-m", "pip", "install", "--quiet"] + REQUIRED_PACKAGES
