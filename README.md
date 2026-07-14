@@ -1,184 +1,306 @@
-# Automated Azure VNet Monitoring — NetBox
+# Runbook — Azure VNet Monitoring via NetBox
 
-**Scope:** Azure VNet CIDRs synced automatically into NetBox as the source of truth, replacing manual tracking.
+**System:** Self-hosted NetBox (Docker) + automated daily Azure VNet sync
+**Deployed:** July 14, 2026
 
-## Problem
+## 0. Fresh deployment walkthrough (from a brand-new VM)
 
-We have a large, ever-growing private network on SCP (Azure). At cluster creation time, a private CIDR range is chosen for each vnet, picked so it doesn't overlap any other CIDR range already in use.
+Use this section if you're standing this up on a new VM from scratch (e.g. disaster recovery, or a second environment). Sections 1+ below assume this has already been done once.
 
-Today this is tracked manually in a shared document. Engineers are expected to update it whenever a vnet/resource is added or removed. In practice:
-
-- People forget to update the page
-- The page drifts from reality (stale/incorrect data)
-- There's no automated way to detect CIDR overlaps before they happen
-- No audit trail of who allocated what, when
-
-We need an automated, self-updating source of truth instead of a manually maintained doc.
-
-## What is NetBox?
-
-[NetBox](https://github.com/netbox-community/netbox) is an open-source **IPAM** (IP Address Management) and **DCIM** (Data Center Infrastructure Management) tool, maintained by **NetBox Labs**. It's the de facto industry standard for network source-of-truth systems.
-
-| | NetBox Community | NetBox Cloud / Enterprise |
-|---|---|---|
-| Cost | Free, Apache 2.0 | Paid, managed by NetBox Labs |
-| Hosting | Self-hosted | Hosted / managed |
-| Fit for this use case | ✅ Yes | Optional future upgrade path |
-
-We're self-hosting the **community edition** via Docker, on a single VM.
-
-## Design decisions and rationale
-
-**Why a self-hosted VM + Docker, not a managed container service (e.g. Azure Container Apps/Instances)?**
-
-A single-VM Docker deployment is the better fit for a stateful app like NetBox: it's a better-documented, more common deployment pattern for this kind of workload, cheaper than a managed container service for an always-on stack, and lowest-maintenance since everything (NetBox, Postgres, Redis) lives in one place.
-
-**Why a custom sync script instead of NetBox Discovery?**
-
-NetBox Discovery is a real, separate NetBox Labs product (open source, self-hostable via the `orb-agent`) for automated network/device discovery. Its discovery backends (nmap-style scanning, SNMP polling) are built for **on-prem network devices reachable directly on the network**, not for querying a cloud provider's management API — none of them talk to Azure's ARM API. **This means NetBox Discovery does not replace the custom sync script** — the script in this package (using the Azure SDK) is the correct tool for populating VNet data from Azure. NetBox Discovery would only be relevant as a separate, additional tool if there's also on-prem network gear to auto-discover via SNMP.
-
-**Why does "IP/Ranges listing" need no extra work?**
-
-That's built into NetBox natively (the Prefixes, IP Ranges, and IP Addresses pages). No additional development needed — once the sync script populates Prefix objects, this hierarchy and utilization view appear automatically as part of NetBox's standard IPAM UI.
-
-## The tool: `azure_to_netbox_sync.py`
-
-A single Python file that keeps NetBox's IPAM data in sync with real Azure VNet address spaces — no separate services, no external scheduler, no manual CIDR tracking in a shared document.
-
-### What it does
-
-- Discovers every VNet's address space across your Azure subscription(s) (read-only — `Reader` role is sufficient)
-- Creates/updates the matching `Prefix` in NetBox, tagged `azure-sync`
-- Flags (never deletes) prefixes that were previously synced but no longer exist in Azure, tagged `stale-review`, for a human to check
-- Detects and logs duplicate CIDRs across VNets (a likely real conflict, not silently ignored)
-- Can install/manage its own daily cron job on the same machine
-- Can bootstrap a **complete NetBox deployment** on a fresh VM — Docker, the NetBox stack, admin user, API token, and this script's own cron job — in one command
-- Self-installs its own Python dependencies on first run
-
-**Scope note:** this syncs VNet-level address spaces only (`vnet.address_space.address_prefixes`). It does not currently sync individual subnet CIDRs within each VNet — that's a separate, well-defined extension if needed later.
-
-### Quick start — everything from scratch on a fresh VM
-
-If NetBox isn't running yet, this is the fastest path — one command sets up NetBox itself, plus the daily sync.
+### 0.1 Install Azure CLI
 
 ```bash
-# Copy azure_to_netbox_sync.py to the VM, then:
+curl -fsSL 'https://azurecliprod.blob.core.windows.net/$root/deb_install.sh' | sudo bash
+```
+
+Verify:
+```bash
+az --version
+```
+
+### 0.2 Log into Azure
+
+```bash
+az login
+```
+
+This opens a browser (or gives you a device code if there's no browser on the VM) to authenticate interactively. **This is the one manual/human step in the entire process** — there's no way to create an Azure credential without authenticating at least once first.
+
+Expected output (abridged):
+```
+A web browser has been opened at https://login.microsoftonline.com/...
+Please continue the login in the web browser...
+Retrieving tenants and subscriptions for the selection...
+
+[Tenant and subscription selection]
+
+No     Subscription name    Subscription ID                       Tenant
+-----  --------------------  ------------------------------------  --------
+[1]  * <your-subscription>   <your-subscription-id>                <tenant>
+
+The subscription '<your-subscription>' is already selected.
+```
+
+Confirm you're on the right subscription:
+```bash
+az account show --output table
+```
+
+### 0.3 Copy the sync script to the VM
+
+Copy `azure_to_netbox_sync.py` to wherever you want it to live (this deployment uses `/root/NetBox-Script/`):
+
+```bash
+mkdir -p /root/NetBox-Script
+# copy azure_to_netbox_sync.py into that directory (scp, git clone, etc.)
+cd /root/NetBox-Script
+```
+
+### 0.4 Run the full bootstrap
+
+```bash
 sudo python3 azure_to_netbox_sync.py --bootstrap \
   --create-azure-sp --azure-subscription-id <your-subscription-id>
 ```
 
-Before running this, you must have already run `az login` once on the VM — that's the one manual step that genuinely can't be automated (there's no way to create an Azure credential without authenticating first).
+This one command installs Docker, deploys NetBox, creates the admin user + API token, creates the Azure service principal, writes the sync config, and installs the daily cron job.
 
-This single command:
-1. Installs Docker Engine + Compose plugin (skips if already present)
-2. Writes a NetBox `docker-compose.yml` + auto-generated secrets (nothing to fill in by hand)
-3. Pulls the NetBox/Postgres/Redis images and starts the stack
-4. Waits until NetBox is actually responding
-5. Creates the NetBox admin user + API token automatically (retries a few times if the database is still finishing first-boot migrations)
-6. Installs the Azure CLI if missing, creates a Reader-only service principal
-7. Writes all of the above into a sync config file
-8. Installs the daily cron job
+**Expected output, start to finish** (this is real output from this exact deployment, timestamps/IDs are from that run):
 
-At the end it prints the NetBox URL, the generated admin password, and confirms what's done.
-
-If you'd rather create the Azure credentials yourself (e.g. org policy requires a specific process), omit `--create-azure-sp` — bootstrap will do everything else and tell you exactly what's left to fill in manually.
-
-### Quick start — NetBox already exists, you just need the sync
-
-```bash
-# 1. Generate a config file
-python3 azure_to_netbox_sync.py --init-config
-# -> writes netbox-azure-sync.env (chmod 600), edit it with real values
-
-# 2. Run once by hand to verify it works before trusting the schedule
-python3 azure_to_netbox_sync.py --config netbox-azure-sync.env
-
-# 3. Install the daily cron job
-python3 azure_to_netbox_sync.py --install-cron --config /path/to/netbox-azure-sync.env
+```
+[bootstrap] Required Python packages not found - installing now...
+[bootstrap] Dependencies installed successfully.
+[bootstrap] $ systemctl enable docker
+[bootstrap] $ systemctl start docker
+[bootstrap] Docker installed and enabled on boot.
+[bootstrap] Wrote /opt/netbox-docker/docker-compose.yml
+[bootstrap] Wrote /opt/netbox-docker/netbox.env (mode 600)
+[bootstrap] Pulling Docker images (netbox, postgres, redis)...
+[bootstrap] $ docker compose pull
+[+] pull 39/39
+ ✔ Image postgres:16-alpine          Pulled                    12.2s
+ ✔ Image redis:7-alpine              Pulled                     6.9s
+ ✔ Image netboxcommunity/netbox:v4.1 Pulled                    19.5s
+[bootstrap] Starting NetBox stack...
+[bootstrap] $ docker compose up -d
+[+] up 10/10
+ ✔ Container netbox-docker-redis-cache-1     Started            5.8s
+ ✔ Container netbox-docker-postgres-1        Started            5.9s
+ ✔ Container netbox-docker-redis-1           Started            5.9s
+ ✔ Container netbox-docker-netbox-1          Started            1.1s
+[bootstrap] Waiting for NetBox to become ready at http://localhost:8000/ ...
 ```
 
-### Go-live checklist
+**At this point, expect a pause of 1-4 minutes.** NetBox runs ~150+ database migrations on first boot before it starts responding to HTTP requests. This is normal, not stuck. If you want to watch it happen live, in a second terminal:
 
-- [ ] `NETBOX_TOKEN` has IPAM read/write access (not full admin) — ideally also Tags write access, since the script manages `azure-sync`/`stale-review` tags
-- [ ] The Azure identity (managed identity or service principal) has `Reader` on every subscription you're syncing — nothing more
-- [ ] Ran once manually and reviewed the summary log before scheduling it
-- [ ] Cron installed and confirmed present (`crontab -l`)
-- [ ] Aware that cron runs in the **server's local timezone**, not necessarily UTC (`timedatectl` to check)
-- [ ] Config file confirmed `chmod 600` (contains a credential)
-- [ ] Existing manual tracking document frozen/archived once NetBox is confirmed accurate
+```bash
+cd /opt/netbox-docker && docker compose logs netbox --tail 5
+```
+(run repeatedly — as long as the `Applying ...` migration names keep changing, it's healthy)
 
-### Configuration reference
+**If the wait exceeds 180 seconds**, the script exits with:
+```
+[bootstrap] NetBox did not become ready within 180s. Check: docker compose logs netbox
+```
+This is not a real failure on a slow VM — confirm migrations actually finished (`docker compose logs netbox --tail 15` should show it transition from migrations to the web server starting, and `curl -I http://localhost:8000/` should return `HTTP/1.1 302 Found`), then simply **re-run the exact same bootstrap command** — every completed step is skipped automatically, and it picks up where it left off.
 
-Set these either as real environment variables, or as `KEY=VALUE` lines in a config file passed via `--config` (required for cron, since cron doesn't inherit your shell's environment):
+Once NetBox responds, the rest completes quickly:
 
-| Variable | Required | Notes |
+```
+[bootstrap] NetBox is responding.
+[bootstrap] Creating NetBox admin user (idempotent - skips if it already exists)...
+[bootstrap] Creating/retrieving API token for admin user...
+[bootstrap] Creating Azure service principal 'netbox-azure-sync' with Reader role...
+[bootstrap] $ az ad sp create-for-rbac --name netbox-azure-sync --role Reader --scopes /subscriptions/<sub-id> --output json
+[bootstrap] Wrote sync config to /root/NetBox-Script/netbox-azure-sync.env (mode 600)
+[bootstrap] Cron job installed: 0 3 * * * /usr/bin/python3 /root/NetBox-Script/azure_to_netbox_sync.py --config /root/NetBox-Script/netbox-azure-sync.env >> /root/NetBox-Script/netbox-azure-sync.log 2>&1 # managed-by:azure_to_netbox_sync.py
+[bootstrap] NOTE: this schedule runs in the server's LOCAL timezone (check `timedatectl`), not necessarily UTC.
+[bootstrap] Logs will be written to: /root/NetBox-Script/netbox-azure-sync.log
+======================================================================
+[bootstrap] DONE.
+  NetBox UI:      http://<this-vm>:8000  (user: admin / <generated-password>)
+  Sync config:    /root/NetBox-Script/netbox-azure-sync.env
+  Cron schedule:  0 3 * * *
+======================================================================
+```
+
+**Copy the admin password from this output now** — it's only printed this once.
+
+### 0.5 Verify by running the sync manually
+
+Don't wait for the 3am cron to find out if it works — run it immediately:
+
+```bash
+python3 azure_to_netbox_sync.py --config netbox-azure-sync.env
+```
+
+Expected output on success (abridged — the real output also includes verbose Azure SDK request/response logging, which is normal and safe to ignore):
+
+```
+[INFO] Loaded config from netbox-azure-sync.env
+[INFO] Environment is configured for ClientSecretCredential
+[INFO] Scanning subscription <sub-id> ...
+[INFO] DefaultAzureCredential acquired a token from EnvironmentCredential
+[INFO] Discovered 1 address prefixes across Azure
+[INFO] Sync complete: 1 created, 0 updated, 0 unchanged, 0 flagged stale, 0 failed
+```
+
+`1 created` on the first run is correct (nothing existed in NetBox yet). Run it again to confirm idempotency — the second run should show `0 created, 0 updated, 1 unchanged, 0 failed` instead.
+
+### 0.6 Confirm in the NetBox UI
+
+Browse to `http://<vm-ip>:8000/ipam/prefixes/`, log in with `admin` / the password from step 0.4, and confirm the discovered VNet CIDR(s) appear with the correct description (`<vnet-name> (<resource-group>)`).
+
+At this point the deployment is fully verified end to end — see sections 1+ below for ongoing operation.
+
+## 1. System overview
+
+| Component | Location | Purpose |
 |---|---|---|
-| `AZURE_SUBSCRIPTION_ID` | Yes | Comma-separate for multiple subscriptions |
-| `NETBOX_URL` | Yes | e.g. `https://netbox.internal.yourcompany.com` |
-| `NETBOX_TOKEN` | Yes | Scope to IPAM (+ Tags) read/write, not admin |
-| `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` | No | Only needed without a managed identity |
-| `SKIP_AUTO_INSTALL` | No | Set to `1` to disable the dependency self-install (e.g. a prebuilt container image) |
+| NetBox stack | `/opt/netbox-docker/` (Docker Compose: netbox, postgres, redis, redis-cache) | Source of truth UI + API |
+| Sync script | `/root/NetBox-Script/azure_to_netbox_sync.py` | Pulls Azure VNet CIDRs, writes them into NetBox |
+| Sync config | `/root/NetBox-Script/netbox-azure-sync.env` | Credentials + settings (mode 600) |
+| Sync logs | `/root/NetBox-Script/netbox-azure-sync.log` | Output of every cron run |
+| Cron schedule | `0 3 * * *` (**server local time** — check with `timedatectl`) | Runs the sync automatically, once daily |
+| NetBox UI | `http://<vm-ip>:8000` | Login: `admin` / (password set at bootstrap — see section 4 if lost) |
 
-Real environment variables always take priority over the config file — useful for a one-off manual override without editing the file.
+**Data flow:** Azure (Reader-only) → sync script → NetBox REST API → Prefixes tagged `azure-sync`.
 
-### CLI reference
+## 2. Routine health checks
 
-| Command | What it does |
-|---|---|
-| `--bootstrap` | Full VM setup: Docker, NetBox, admin user + token, config, cron. Requires root. |
-| `--bootstrap --create-azure-sp --azure-subscription-id <id>` | Same, plus auto-creates the Azure service principal (requires prior `az login`) |
-| `--init-config [--config path]` | Write a starter config file with placeholder values |
-| `--config path` (no other flags) | Run the sync once, using that config file |
-| (no flags, real env vars set) | Run the sync once, using the shell environment |
-| `--install-cron --config path [--cron-schedule "0 3 * * *"] [--log-file path]` | Install/update the daily cron job |
-| `--uninstall-cron` | Remove this script's cron entry (leaves other cron jobs untouched) |
+Run these periodically (weekly is reasonable) to confirm everything's still healthy:
 
-### How the sync behaves (safety properties)
+```bash
+# 1. Are all 4 containers up?
+cd /opt/netbox-docker && docker compose ps
+# Expect: netbox, postgres, redis, redis-cache all "Up"
 
-- **Never deletes.** A prefix that disappears from Azure gets tagged `stale-review`, never removed — a human decides.
-- **Idempotent.** Safe to re-run manually or via cron repeatedly; won't create duplicates or clobber fields it doesn't own.
-- **Duplicate CIDRs are flagged, not silently resolved.** If the same CIDR appears across two VNets (a real conflict, however rare), the script keeps one, logs a loud warning naming every source, and marks it in the NetBox description for review.
-- **Resilient to a slow/flaky NetBox.** API calls use a session with a 30s timeout and automatic retry on 429/5xx — a transient blip doesn't fail the whole run.
-- **Resilient to first-boot races (bootstrap mode).** Creating the admin user/token retries a few times, since a truly fresh container can still be finishing database migrations even after the HTTP endpoint starts responding.
+# 2. Is the cron job still installed?
+crontab -l
+# Expect a line ending in: # managed-by:azure_to_netbox_sync.py
 
-### Security notes
+# 3. Did the last scheduled sync succeed?
+tail -30 /root/NetBox-Script/netbox-azure-sync.log
+# Expect a line like: "Sync complete: X created, Y updated, Z unchanged, 0 failed"
+# If "failed" is non-zero, see section 6 (Troubleshooting)
 
-- The config file is `chmod 600`'d automatically since it holds a credential — but it's still plaintext on disk. Fine for a single VM; if your org needs stricter handling, populate the file from a secrets manager (e.g. Azure Key Vault) right before each cron run instead of storing values there permanently.
-- The Azure identity should only ever have `Reader` — this script never writes to Azure.
-- The NetBox token should be scoped to IPAM (+ Tags), not a superuser/admin token.
-- If dependency auto-install (`--break-system-packages`) is blocked by your org's Python policy, create and activate a venv before running the script — dependencies will then install cleanly into it without needing that flag at all.
+# 4. Spot-check NetBox UI
+# Browse to http://<vm-ip>:8000/ipam/prefixes/ and confirm the prefix count
+# looks right and nothing is unexpectedly tagged "stale-review"
+```
 
-### Troubleshooting
+## 3. Common tasks
 
-**"Config file not found"** — check the path passed to `--config` is correct and absolute (cron needs an absolute path, since it doesn't run from your current directory).
+### Run the sync manually (outside the schedule)
+```bash
+cd /root/NetBox-Script
+python3 azure_to_netbox_sync.py --config netbox-azure-sync.env
+```
+Safe to run anytime — idempotent. A healthy run ends with `0 failed`.
 
-**Cron job doesn't seem to run** — confirm with `crontab -l` that the entry exists, check the log file path you configured, and confirm the server's local timezone matches your expectation (`timedatectl`).
+### Check what the sync will do before it does it
+There's no dry-run flag currently. To preview: check **IPAM → Prefixes** in the UI first, compare against what you expect from the Azure Portal, then run the sync and diff afterward.
 
-**`--bootstrap` fails at Azure SP creation** — you likely haven't run `az login` yet on that VM. This is the one step that requires interactive human authentication; run it once, then re-run `--bootstrap --create-azure-sp`.
+### View/change the cron schedule
+```bash
+# View current schedule
+crontab -l
 
-**Dependency install fails / blocked** — see the Security notes above about using a venv instead of `--break-system-packages`.
+# Change it (e.g. to 2am instead of 3am)
+python3 /root/NetBox-Script/azure_to_netbox_sync.py \
+  --install-cron --config /root/NetBox-Script/netbox-azure-sync.env \
+  --cron-schedule "0 2 * * *"
+# Re-running --install-cron is idempotent - it replaces the existing entry, no duplicates
+```
 
-**A CIDR I expect to see isn't in NetBox** — check the log summary from the last run (created/updated/unchanged/stale/failed counts), and check for a `DUPLICATE CIDR DETECTED` warning, which would explain why a range you expected went to a different VNet's record.
+### Temporarily disable the automated sync
+```bash
+python3 /root/NetBox-Script/azure_to_netbox_sync.py --uninstall-cron
+```
+NetBox itself keeps running; only the daily Azure pull stops. Re-enable with `--install-cron` (see above) when ready.
 
-## Open questions
+### Add a new engineer with NetBox access
+1. Log into NetBox as `admin` → **Organization → Users** (top nav / admin menu)
+2. Create a new user, assign appropriate permissions (read-only for most engineers; avoid handing out admin)
+3. For programmatic/API access, generate a scoped API token for that user (not the shared admin token)
 
-- Should on-prem/SNMP-based network discovery (via NetBox Discovery / `orb-agent`) be scoped as a separate follow-up? Not applicable to Azure VNet tracking, but may be worth pursuing independently if there's on-prem network gear we also want auto-documented.
-- SSO integration for engineer access to NetBox?
-- Do we need VRF separation, or is a flat prefix hierarchy sufficient for our use case?
-- Is subnet-level CIDR tracking (not just VNet-level) needed, or is VNet-level sufficient?
-- Is topology mapping (VNet peerings/NSGs/device relationships — "what's connected to what") in scope now, or a separate follow-up?
+## 4. Credential recovery
 
-## Files in this package
+### Lost the NetBox admin password
+```bash
+cd /opt/netbox-docker
+docker compose exec netbox /opt/netbox/netbox/manage.py changepassword admin
+```
+Prompts interactively for a new password.
 
-| File | Purpose |
-|---|---|
-| `README.md` | This document |
-| `azure_to_netbox_sync.py` | The single-file tool: NetBox bootstrap + Azure sync + cron management |
+### Lost/need to rotate the NetBox API token used by the sync script
+1. Log into NetBox UI as `admin`
+2. **Admin → API Tokens** → find the sync's token, or create a new one (scope: IPAM + Tags read/write, not full admin)
+3. Update `NETBOX_TOKEN=` in `/root/NetBox-Script/netbox-azure-sync.env`
+4. Test: `python3 azure_to_netbox_sync.py --config netbox-azure-sync.env`
 
-## References
+### Rotate the Azure service principal credentials
+```bash
+# Create a new client secret for the existing SP (avoids recreating the whole SP)
+az ad sp credential reset --name netbox-azure-sync
 
-- NetBox docs: https://docs.netbox.dev/
-- NetBox Community (GitHub): https://github.com/netbox-community/netbox
-- NetBox Docker deployment (pattern this script's `--bootstrap` follows): https://github.com/netbox-community/netbox-docker
-- NetBox Labs: https://netboxlabs.com/
-- NetBox Discovery (`orb-agent`, on-prem/SNMP discovery — not used by this tool, see "Design decisions and rationale" above): https://github.com/netboxlabs/orb-agent
+# Update netbox-azure-sync.env with the new AZURE_CLIENT_SECRET value printed above
+```
+Then verify with a manual sync run.
+
+## 5. Backup & recovery
+
+**What matters:** the Postgres database (all of NetBox's data lives there).
+
+```bash
+# Manual backup
+cd /opt/netbox-docker
+docker compose exec -T postgres pg_dump -U netbox netbox | gzip > /root/netbox-backup-$(date +%F).sql.gz
+```
+
+There is currently **no automated backup schedule configured** — this is a gap worth closing. Recommended: add a second cron entry running the above nightly, shipping the output somewhere off this VM (Azure Blob Storage, etc.), since a single-VM deployment has no redundancy if the disk is lost.
+
+**Restore from backup:**
+```bash
+cd /opt/netbox-docker
+docker compose exec -T postgres psql -U netbox -d netbox < netbox-backup-YYYY-MM-DD.sql
+```
+Do this only against an empty/fresh database — restoring on top of live data can conflict.
+
+## 6. Troubleshooting
+
+This section is built from actual issues hit during this deployment — check here first before treating something as a new problem.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `No module named pip` during bootstrap | Fresh VM shipped without `python3-pip` | `sudo apt-get update && sudo apt-get install -y python3-pip`, then re-run `--bootstrap`. (Later script versions auto-handle this.) |
+| `FileNotFoundError: docker` during bootstrap | Docker not yet installed, and the check itself crashed instead of detecting that | Fixed in the current script version (`_command_succeeds()` handles this safely). If seen again, confirm you're running the latest copy of the script. |
+| `[bootstrap] NetBox did not become ready within 180s` | First-boot DB migrations on a fresh Postgres take longer than the wait window on some VMs | Not a real failure. Check `docker compose logs netbox --tail 15` — if migrations are still progressing, just wait, then re-run `--bootstrap` (idempotent, skips completed steps) |
+| `CommandError: You must use --username with --noinput` during admin user creation | `docker compose exec` does not forward host environment variables into the container | Fixed in the current script version (uses `docker compose exec -e KEY=VALUE ...` explicitly). Confirm you're on the latest script if seen again. |
+| `400 Bad Request: Related objects must be referenced by numeric ID or by dictionary of attributes... azure-sync` | NetBox's REST API requires tags as `{"slug": ...}` dicts, not bare strings | Fixed in the current script version. Confirm latest script if seen again. |
+| Sync reports `X failed` | Usually a NetBox API or Azure auth issue | Run manually (`python3 azure_to_netbox_sync.py --config ...`) to see the full error, not just the summary line |
+| A prefix is tagged `stale-review` unexpectedly | The sync no longer sees that VNet in Azure | Confirm in the Azure Portal whether the VNet was actually deleted/renamed. If it's a false positive (e.g. transient Azure API issue), it'll clear automatically on the next successful run once the VNet is seen again — nothing is ever auto-deleted, so no data was lost either way |
+| Duplicate CIDR warning in logs (`DUPLICATE CIDR DETECTED`) | Two VNets genuinely share the same address space | This is very likely a real Azure network conflict — investigate in the Azure Portal, not a script bug |
+| Cron doesn't seem to run at the expected time | Server's local timezone differs from what you assumed | `timedatectl` to check; the schedule is in local time, not UTC |
+| `NETBOX_URL` unreachable from cron but works manually | Config file path issue — cron needs an absolute path | Confirm `crontab -l` shows an absolute path to both the script and `--config` file |
+
+## 7. Security notes
+
+- `netbox-azure-sync.env` contains a live credential — confirm it stays `chmod 600` (`ls -la` to check)
+- The Azure service principal (`netbox-azure-sync`) should only ever have `Reader` role — verify periodically via `az role assignment list --assignee <appId>`
+- The NetBox API token used by the sync should be scoped to IPAM (+ Tags), not the full admin token — if it currently *is* the admin token, consider creating a scoped one and rotating (see section 4)
+- No SSO is currently configured — all access is local NetBox accounts
+
+## 8. Known limitations (by design, not bugs)
+
+- **VNet-level CIDRs only** — subnet-level CIDRs within each VNet are not synced. Extending this is a defined, separate piece of work if needed.
+- **No automatic reservation workflow** — engineers manually check NetBox's "available prefixes" before writing Terraform `tfvars`; nothing reserves a range automatically. Small race-condition risk if two engineers provision simultaneously (documented, accepted tradeoff for simplicity).
+- **No topology mapping** — NetBox tracks CIDRs, not VNet peerings/NSGs/"what's connected to what." Out of scope for this deployment as built.
+- **Single VM, no HA** — if this VM is lost, NetBox and its data go with it unless backups (section 5) are actually being taken regularly. This is currently a manual/undone step, not automated.
+
+## 9. Escalation
+
+For issues not covered above:
+1. Check `/root/NetBox-Script/netbox-azure-sync.log` and `docker compose logs netbox` for the actual error text first
+2. NetBox community docs: https://docs.netbox.dev/
+3. NetBox GitHub issues (for suspected NetBox bugs): https://github.com/netbox-community/netbox/issues
